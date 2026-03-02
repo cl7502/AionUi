@@ -1,33 +1,32 @@
-name: Sync Fork
+name: Sync Fork (Mirror)
 
 on:
   schedule:
     - cron: "0 */6 * * *"   # 每6小时
   workflow_dispatch:
 
+permissions:
+  contents: write
+
 jobs:
   sync:
     runs-on: ubuntu-latest
 
     steps:
-      - name: Checkout repo
-        uses: actions/checkout@v4
-        with:
-          fetch-depth: 0   # 必须，否则拿不到全部历史
-
-      - name: Sync upstream
+      - name: Mirror upstream repository
         run: |
-          git config --global user.name "github-actions"
-          git config --global user.email "github-actions@users.noreply.github.com"
+          set -e
 
-          # 添加 upstream
-          git remote add upstream https://github.com/cl7502/AionUi.git
+          UPSTREAM="https://github.com/cl7502/AionUi.git"
+          TARGET="https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/${{ github.repository }}.git"
 
-          # 拉取 upstream 所有内容
-          git fetch upstream --prune
+          echo "Cloning upstream..."
+          git clone --mirror $UPSTREAM repo
 
-          # 推送所有 branch
-          git push origin --all
+          cd repo
 
-          # 推送所有 tag
-          git push origin --tags
+          echo "Setting push target..."
+          git remote set-url --push origin $TARGET
+
+          echo "Mirroring everything (branches + tags)..."
+          git push --mirror
