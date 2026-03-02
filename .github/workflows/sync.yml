@@ -1,0 +1,33 @@
+name: Sync Fork
+
+on:
+  schedule:
+    - cron: "0 */6 * * *"   # 每6小时
+  workflow_dispatch:
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0   # 必须，否则拿不到全部历史
+
+      - name: Sync upstream
+        run: |
+          git config --global user.name "github-actions"
+          git config --global user.email "github-actions@users.noreply.github.com"
+
+          # 添加 upstream
+          git remote add upstream https://github.com/cl7502/AionUi.git
+
+          # 拉取 upstream 所有内容
+          git fetch upstream --prune
+
+          # 推送所有 branch
+          git push origin --all
+
+          # 推送所有 tag
+          git push origin --tags
