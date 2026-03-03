@@ -2,20 +2,19 @@ name: Auto Merge Upstream
 
 on:
   schedule:
-    - cron: "0 */6 * * *"  # 每6小时自动跑一次
-  workflow_dispatch:      # 允许你手动点击 "Run workflow" 测试
+    - cron: "0 */6 * * *"
+  workflow_dispatch:
 
-permissions:
-  contents: write
 jobs:
   merge:
     runs-on: ubuntu-latest
-
     steps:
       - name: Checkout Your Fork
         uses: actions/checkout@v4
         with:
-          fetch-depth: 0 # 必须设为0，获取完整历史才能进行合并
+          fetch-depth: 0
+          # 使用你刚才创建的 PAT，它天然拥有修改 workflow 的权利
+          token: ${{ secrets.SYNC_PAT }}
 
       - name: Config Git User
         run: |
@@ -24,23 +23,18 @@ jobs:
 
       - name: Fetch and Merge Upstream
         run: |
-          # 1. 添加真正的源仓库（iOfficeAI）作为 upstream
+          # 1. 添加真正的源仓库
           git remote add upstream https://github.com/iOfficeAI/AionUi.git
-          
-          # 2. 拉取源仓库的所有更新
           git fetch upstream
 
-          # 3. 确保你在自己的主分支上 (如果是 master 请改为 master)
+          # 2. 切换并合并
           git checkout main
-
-          # 4. 将源仓库的更新合并到你的分支
-          # --no-edit 表示自动生成合并记录，不弹出编辑器
-          echo "Merging from iOfficeAI..."
+          echo "Starting merge..."
+          # 合并上游 main 到你的 main
           git merge upstream/main --no-edit || {
-            echo "Conflict detected! You need to resolve conflicts manually on your local machine."
+            echo "Conflict detected! You must resolve it manually."
             exit 1
           }
 
-          # 5. 推送合并后的代码回到你的仓库 (cl7502)
-          # 注意：这里不能用 --mirror，否则会抹掉你的本地提交
+          # 3. 推送结果
           git push origin main
