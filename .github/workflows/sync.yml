@@ -1,32 +1,47 @@
-name: Sync Fork (Mirror)
+name: Auto Merge Upstream
 
 on:
   schedule:
-    - cron: "0 */6 * * *"   # 每6小时
-  workflow_dispatch:
+    - cron: "0 */6 * * *"  # 每6小时自动跑一次
+  workflow_dispatch:      # 允许你手动点击 "Run workflow" 测试
 
 permissions:
   contents: write
 
 jobs:
-  sync:
+  merge:
     runs-on: ubuntu-latest
 
     steps:
-      - name: Mirror upstream repository
+      - name: Checkout Your Fork
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0 # 必须设为0，获取完整历史才能进行合并
+
+      - name: Config Git User
         run: |
-          set -e
+          git config --global user.name "github-actions[bot]"
+          git config --global user.email "github-actions[bot]@users.noreply.github.com"
 
-          UPSTREAM="https://github.com/cl7502/AionUi.git"
-          TARGET="https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/${{ github.repository }}.git"
+      - name: Fetch and Merge Upstream
+        run: |
+          # 1. 添加真正的源仓库（iOfficeAI）作为 upstream
+          git remote add upstream https://github.com/iOfficeAI/AionUi.git
+          
+          # 2. 拉取源仓库的所有更新
+          git fetch upstream
 
-          echo "Cloning upstream..."
-          git clone --mirror $UPSTREAM repo
+          # 3. 确保你在自己的主分支上 (如果是 master 请改为 master)
+          git checkout main
 
-          cd repo
+          # 4. 将源仓库的更新合并到你的分支
+          # --no-edit 表示自动生成合并记录，不弹出编辑器
+          echo "Merging from iOfficeAI..."
+          git merge upstream/main --no-edit || {
+            echo "Conflict detected! You need to resolve conflicts manually on your local machine."
+            exit 1
+          }
 
-          echo "Setting push target..."
-          git remote set-url --push origin $TARGET
-
-          echo "Mirroring everything (branches + tags)..."
-          git push --mirror
+          # 5. 推送合并后的代码回到你的仓库 (cl7502)
+          # 注意：这里不能用 --mirror，否则会抹掉你的本地提交
+          git push origin main
