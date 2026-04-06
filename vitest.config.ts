@@ -5,7 +5,7 @@ const aliases = {
   '@/': path.resolve(__dirname, './src') + '/',
   '@process/': path.resolve(__dirname, './src/process') + '/',
   '@renderer/': path.resolve(__dirname, './src/renderer') + '/',
-  '@worker/': path.resolve(__dirname, './src/worker') + '/',
+  '@worker/': path.resolve(__dirname, './src/process/worker') + '/',
   '@mcp/models/': path.resolve(__dirname, './src/common/models') + '/',
   '@mcp/types/': path.resolve(__dirname, './src/common') + '/',
   '@mcp/': path.resolve(__dirname, './src/common') + '/',
@@ -26,7 +26,12 @@ export default defineConfig({
         test: {
           name: 'node',
           environment: 'node',
-          include: ['tests/unit/**/*.test.ts', 'tests/unit/**/test_*.ts', 'tests/integration/**/*.test.ts'],
+          include: [
+            'tests/unit/**/*.test.ts',
+            'tests/unit/**/test_*.ts',
+            'tests/integration/**/*.test.ts',
+            'tests/regression/**/*.test.ts',
+          ],
           exclude: ['tests/unit/**/*.dom.test.ts', 'tests/unit/**/*.dom.test.tsx'],
           setupFiles: ['./tests/vitest.setup.ts'],
         },
@@ -44,17 +49,41 @@ export default defineConfig({
     ],
     coverage: {
       provider: 'v8',
-      reporter: ['text', 'text-summary', 'html'],
+      reporter: ['text', 'text-summary', 'html', 'lcov'],
       reportsDirectory: './coverage',
-      // 手动指定需要覆盖的源文件，确保只检测新增/修改的逻辑
-      // 新增功能时，将对应的源文件路径添加到此数组
-      // 例如: 'src/process/services/newService.ts'
-      include: ['src/process/services/autoUpdaterService.ts', 'src/process/bridge/updateBridge.ts', 'src/utils/configureChromium.ts', 'src/process/bridge/applicationBridge.ts'],
+      // Cover ALL source code by default — new files are automatically included.
+      // Only exclude files that genuinely cannot be unit-tested (entry points,
+      // type-only files, static assets, etc.).
+      include: ['src/**/*.{ts,tsx}', 'scripts/prepareBundledBun.js'],
+      exclude: [
+        // Type declaration files (no runtime code)
+        'src/**/*.d.ts',
+
+        // Electron entry points (require Electron runtime)
+        'src/index.ts',
+        'src/preload.ts',
+
+        // Shims / polyfills
+        'src/common/utils/shims/**',
+
+        // Pure type / constant files
+        'src/common/types/**',
+
+        // Static assets and i18n JSON (no logic)
+        'src/renderer/**/*.json',
+        'src/renderer/**/*.svg',
+        'src/renderer/**/*.css',
+
+        // i18n config (JSON-only)
+        'src/common/config/i18n-config.json',
+      ],
+      // Thresholds apply to the included file set.
+      // Keeping them informational until coverage ramps up across all files.
       thresholds: {
-        statements: 30,
-        branches: 10,
-        functions: 35,
-        lines: 30,
+        statements: 0,
+        branches: 0,
+        functions: 0,
+        lines: 0,
       },
     },
   },

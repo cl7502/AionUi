@@ -4,29 +4,34 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-import { channelEventBus } from '@/channels/agent/ChannelEventBus';
+import { channelEventBus } from '@process/channels/agent/ChannelEventBus';
 import { ipcBridge } from '@/common';
-import type { CronMessageMeta, IMessageToolGroup, TMessage } from '@/common/chatLib';
-import { transformMessage } from '@/common/chatLib';
-import type { IResponseMessage } from '@/common/ipcBridge';
-import type { IMcpServer, TProviderWithModel } from '@/common/storage';
-import { ProcessConfig, getSkillsDir } from '@/process/initStorage';
+import type { CronMessageMeta, IMessageText, IMessageToolGroup, TMessage } from '@/common/chat/chatLib';
+import { transformMessage } from '@/common/chat/chatLib';
+import type { IResponseMessage } from '@/common/adapter/ipcBridge';
+import type { IMcpServer, TProviderWithModel } from '@/common/config/storage';
+import { ProcessConfig, getSkillsDir } from '@process/utils/initStorage';
+import { ExtensionRegistry } from '@process/extensions';
 import { buildSystemInstructionsWithSkillsIndex } from './agentUtils';
 import { detectSkillLoadRequest, AcpSkillManager, buildSkillContentText } from './AcpSkillManager';
 import { uuid } from '@/common/utils';
 import { getProviderAuthType } from '@/common/utils/platformAuthType';
-import { AuthType, getOauthInfoWithCache } from '@office-ai/aioncli-core';
-import { GeminiApprovalStore } from '../../agent/gemini/GeminiApprovalStore';
-import { ToolConfirmationOutcome } from '../../agent/gemini/cli/tools/tools';
-import { getDatabase } from '@process/database';
-import { addMessage, addOrUpdateMessage, nextTickToLocalFinish } from '../message';
+import { AuthType, getOauthInfoWithCache, Storage } from '@office-ai/aioncli-core';
+import { GeminiApprovalStore } from '../agent/gemini/GeminiApprovalStore';
+import { ToolConfirmationOutcome } from '../agent/gemini/cli/tools/tools';
+import { getDatabase } from '@process/services/database';
+import { addMessage, addOrUpdateMessage, nextTickToLocalFinish } from '@process/utils/message';
 import { cronBusyGuard } from '@process/services/cron/CronBusyGuard';
-import { handlePreviewOpenEvent } from '../utils/previewUtils';
+import { skillSuggestWatcher } from '@process/services/cron/SkillSuggestWatcher';
+import { handlePreviewOpenEvent } from '@process/utils/previewUtils';
 import BaseAgentManager from './BaseAgentManager';
-import { mainLog, mainWarn, mainError } from '../utils/mainLogger';
+import { IpcAgentEventEmitter } from './IpcAgentEventEmitter';
+import { mainLog, mainWarn, mainError } from '@process/utils/mainLogger';
 import { hasCronCommands } from './CronCommandDetector';
 import { extractTextFromMessage, processCronInMessage } from './MessageMiddleware';
-import { stripThinkTags } from './ThinkTagDetector';
+import { stripThinkTags, extractAndStripThinkTags } from './ThinkTagDetector';
+import { teamEventBus } from '@process/team/teamEventBus';
+import * as fs from 'node:fs';
 
 // gemini agent管理器类
 type UiMcpServerConfig = {
@@ -43,7 +48,6 @@ export class GeminiAgentManager extends BaseAgentManager<
   {
     workspace: string;
     model: TProviderWithModel;
-    imageGenerationModel?: TProviderWithModel;
     webSearchEngine?: 'google' | 'default';
     mcpServers?: Record<string, UiMcpServerConfig>;
     contextFileName?: string;
@@ -66,6 +70,7 @@ export class GeminiAgentManager extends BaseAgentManager<
   presetRules?: string;
   contextContent?: string;
   enabledSkills?: string[];
+  excludeBuiltinSkills?: string[];
   private bootstrap: Promise<void>;
 
   /** Fingerprint of MCP config used by the current worker, for change detection */
@@ -75,7 +80,29 @@ export class GeminiAgentManager extends BaseAgentManager<
   readonly approvalStore = new GeminiApprovalStore();
 
   private async injectHistoryFromDatabase(): Promise<void> {
-    // ... (omitting injectHistoryFromDatabase for space)
+    try {
+      const result = (await getDatabase()).getConversationMessages(this.conversation_id, 0, 10000);
+      const data = (result.data || []) as TMessage[];
+      const lines = data
+        .filter((m): m is IMessageText => m.type === 'text')
+        .slice(-20)
+        .map((m) => `${m.position === 'right' ? 'User' : 'Assistant'}: ${m.content.content || ''}`);
+      const text = lines.join('\n').slice(-4000);
+      if (text) {
+        await this.postMessagePromise('init.history', { text });
+      }
+    } catch (e) {
+      // ignore history injection errors
+    }
+  }
+
+  /**
+   * Abort the current stream, then rebuild Gemini's in-memory conversation
+   * state from persisted history so the next turn keeps prior context.
+   */
+  async stop() {
+    await super.stop();
+    await this.injectHistoryFromDatabase();
   }
 
   /** Force yolo mode (for cron jobs) / 强制 yolo 模式（用于定时任务） */
@@ -84,8 +111,25 @@ export class GeminiAgentManager extends BaseAgentManager<
   /** Current session mode for approval behavior / 当前会话模式（影响审批行为） */
   private currentMode: string = 'default';
 
+  /** Current turn's thinking message msg_id for accumulating content */
+  private thinkingMsgId: string | null = null;
+  /** Timestamp when thinking started for duration calculation */
+  private thinkingStartTime: number | null = null;
+  /** Accumulated thinking content for persistence */
+  private thinkingContent: string = '';
+  private thinkingDbFlushTimer: ReturnType<typeof setTimeout> | null = null;
+  private readonly thinkingDbFlushIntervalMs = 120;
+
   /** Stored webSearchEngine for worker re-bootstrap / 保存 webSearchEngine 用于重建 worker */
   private webSearchEngine?: 'google' | 'default';
+
+  /** Team MCP stdio config injected by TeamSessionService */
+  private teamMcpStdioConfig?: {
+    name: string;
+    command: string;
+    args: string[];
+    env: Array<{ name: string; value: string }>;
+  };
 
   constructor(
     data: {
@@ -102,22 +146,36 @@ export class GeminiAgentManager extends BaseAgentManager<
       yoloMode?: boolean;
       /** Persisted session mode for resume support / 持久化的会话模式，用于恢复 */
       sessionMode?: string;
+      /** Team MCP server stdio config injected by TeamSessionService */
+      teamMcpStdioConfig?: {
+        name: string;
+        command: string;
+        args: string[];
+        env: Array<{ name: string; value: string }>;
+      };
+      /** Builtin skill names to exclude from discovery (e.g. 'cron' for cron-spawned conversations) */
+      excludeBuiltinSkills?: string[];
     },
     model: TProviderWithModel
   ) {
-    super('gemini', { ...data, model });
+    super('gemini', { ...data, model }, new IpcAgentEventEmitter());
     this.workspace = data.workspace;
     this.conversation_id = data.conversation_id;
     this.model = model;
     this.contextFileName = data.contextFileName;
     this.presetRules = data.presetRules;
     this.enabledSkills = data.enabledSkills;
+    this.excludeBuiltinSkills = data.excludeBuiltinSkills;
     this.forceYoloMode = data.yoloMode;
     this.currentMode = data.sessionMode || 'default';
     this.webSearchEngine = data.webSearchEngine;
+    this.teamMcpStdioConfig = data.teamMcpStdioConfig;
     // 向后兼容 / Backward compatible
     this.contextContent = data.contextContent || data.presetRules;
     this.bootstrap = this.createBootstrap();
+    // Prevent unhandled rejection when bootstrap fails (e.g. missing OAuth credentials).
+    // The error still propagates when sendMessage() awaits this.bootstrap.
+    this.bootstrap.catch(() => {});
   }
 
   /**
@@ -125,36 +183,40 @@ export class GeminiAgentManager extends BaseAgentManager<
    * Extracted to allow re-bootstrapping when MCP config changes.
    */
   private createBootstrap(): Promise<void> {
-    return Promise.all([ProcessConfig.get('gemini.config'), this.getImageGenerationModel(), this.getMcpServers()])
-      .then(async ([config, imageGenerationModel, mcpServers]) => {
+    return Promise.all([ProcessConfig.get('gemini.config'), this.getMcpServers()])
+      .then(async ([config, mcpServers]) => {
         let projectId: string | undefined;
         const authType = getProviderAuthType(this.model);
         const needsGoogleOAuth = authType === AuthType.LOGIN_WITH_GOOGLE || authType === AuthType.USE_VERTEX_AI;
 
         if (needsGoogleOAuth) {
           try {
-            const oauthInfo = await getOauthInfoWithCache(config?.proxy);
-            if (oauthInfo && oauthInfo.email && config?.accountProjects) {
-              projectId = config.accountProjects[oauthInfo.email];
+            const credsPath = Storage.getOAuthCredsPath();
+            if (fs.existsSync(credsPath)) {
+              const oauthInfo = await getOauthInfoWithCache(config?.proxy);
+              if (oauthInfo && oauthInfo.email && config?.accountProjects) {
+                projectId = config.accountProjects[oauthInfo.email];
+              }
             }
           } catch {
             // If account retrieval fails, don't set projectId
           }
         }
 
-        // Build system instructions with skills INDEX only (not full content)
-        // 使用 skills 索引构建系统指令（不注入全文，按需通过 activate_skill 加载）
-        // Builtin skills (e.g. cron) are auto-included in the index by AcpSkillManager
+        // presetRules are now written to GEMINI.md by setupAssistantWorkspace()
+        // and loaded natively by Gemini CLI via loadServerHierarchicalMemory()
+        // Skills are symlinked into .gemini/skills/ and discovered natively by SkillManager
+        // No prompt injection needed -> native mechanisms handle everything
+
+        // Merge builtin skill names into enabledSkills for the worker's skill discovery
+        // 将内置 skill 名称合并到 enabledSkills，使 worker 的 SkillManager 能找到它们
         const skillManager = AcpSkillManager.getInstance(this.enabledSkills);
         await skillManager.discoverSkills(this.enabledSkills);
-        const finalPresetRules = await buildSystemInstructionsWithSkillsIndex({
-          presetContext: this.presetRules,
-          enabledSkills: this.enabledSkills,
-        });
-
-        // Merge builtin skill names into enabledSkills for the worker's activate_skill tool
-        // 将内置 skill 名称合并到 enabledSkills，使 worker 的 activate_skill 能找到它们
-        const builtinSkillNames = skillManager.getBuiltinSkillsIndex().map((s) => s.name);
+        const excludeSet = new Set(this.excludeBuiltinSkills ?? []);
+        const builtinSkillNames = skillManager
+          .getBuiltinSkillsIndex()
+          .map((s) => s.name)
+          .filter((name) => !excludeSet.has(name));
         const allEnabledSkills = [...new Set([...builtinSkillNames, ...(this.enabledSkills || [])])];
 
         // Determine yoloMode from legacy config (SecurityModalContent)
@@ -172,15 +234,16 @@ export class GeminiAgentManager extends BaseAgentManager<
           GOOGLE_CLOUD_PROJECT: projectId,
           workspace: this.workspace,
           model: this.model,
-          imageGenerationModel,
           webSearchEngine: this.webSearchEngine,
           mcpServers,
           contextFileName: this.contextFileName,
-          presetRules: finalPresetRules,
+          // presetRules are no longer injected here — they are in GEMINI.md
+          // Keep for backward compatibility with existing conversations
+          presetRules: this.presetRules,
           contextContent: this.contextContent,
           skillsDir: getSkillsDir(),
-          // 启用的 skills 列表（含内置 skills），用于 worker 的 activate_skill 工具
-          // Enabled skills list (including builtins) for worker's activate_skill tool
+          // 启用的 skills 列表（含内置 skills），用于 worker 的 SkillManager
+          // Enabled skills list (including builtins) for worker's SkillManager
           enabledSkills: allEnabledSkills,
           // Yolo mode: derived from currentMode, not directly from legacy config
           yoloMode: effectiveYoloMode,
@@ -189,17 +252,6 @@ export class GeminiAgentManager extends BaseAgentManager<
       .then(async () => {
         await this.injectHistoryFromDatabase();
       });
-  }
-
-  private getImageGenerationModel(): Promise<TProviderWithModel | undefined> {
-    return ProcessConfig.get('tools.imageGenerationModel')
-      .then((imageGenerationModel) => {
-        if (imageGenerationModel && imageGenerationModel.switch) {
-          return imageGenerationModel;
-        }
-        return undefined;
-      })
-      .catch(() => Promise.resolve(undefined));
   }
 
   /**
@@ -213,29 +265,62 @@ export class GeminiAgentManager extends BaseAgentManager<
     const entries = mcpServers
       .map((s: IMcpServer) => {
         // Include transport identity so config changes (e.g. different command/url) are detected
-        const transportKey = s.transport.type === 'stdio' ? `${s.transport.command}|${(s.transport.args || []).join(',')}` : 'url' in s.transport ? s.transport.url : '';
+        const transportKey =
+          s.transport.type === 'stdio'
+            ? `${s.transport.command}|${(s.transport.args || []).join(',')}`
+            : 'url' in s.transport
+              ? s.transport.url
+              : '';
         return { n: s.name, e: s.enabled, st: s.status, t: transportKey };
       })
-      .sort((a, b) => a.n.localeCompare(b.n));
+      .toSorted((a, b) => a.n.localeCompare(b.n));
     return JSON.stringify(entries);
   }
 
   private async getMcpServers(): Promise<Record<string, UiMcpServerConfig>> {
     try {
       const mcpServers = await ProcessConfig.get('mcp.config');
-      if (!mcpServers || !Array.isArray(mcpServers)) {
+      const allServers: IMcpServer[] = Array.isArray(mcpServers) ? mcpServers : [];
+
+      // Merge extension-contributed MCP servers
+      // 合并扩展贡献的 MCP servers
+      try {
+        const registry = ExtensionRegistry.getInstance();
+        const extServers = registry.getMcpServers();
+        for (const extServer of extServers) {
+          const transport = extServer.transport as IMcpServer['transport'];
+          if (!transport) continue;
+          // Only include enabled extension servers (they don't have status since they're declarative)
+          if (extServer.enabled === false) continue;
+          allServers.push({
+            id: String(extServer.id || ''),
+            name: String(extServer.name || ''),
+            description: extServer.description as string | undefined,
+            enabled: true,
+            transport,
+            status: 'connected', // Extension MCP servers are treated as available
+            createdAt: (extServer.createdAt as number) || Date.now(),
+            updatedAt: (extServer.updatedAt as number) || Date.now(),
+            originalJson: String(extServer.originalJson || '{}'),
+          });
+        }
+      } catch (extError) {
+        console.warn('[GeminiAgentManager] Failed to load extension MCP servers:', extError);
+      }
+
+      if (allServers.length === 0) {
         this.mcpFingerprint = '[]';
         return {};
       }
 
       // Store fingerprint for later change detection
       // 保存指纹用于后续变更检测
-      this.mcpFingerprint = GeminiAgentManager.computeMcpFingerprint(mcpServers);
+      this.mcpFingerprint = GeminiAgentManager.computeMcpFingerprint(allServers);
 
       // 转换为 aioncli-core 期望的格式
       // MCPServerConfig supports: stdio (command/args/env), sse/http (url/type/headers)
       const mcpConfig: Record<string, UiMcpServerConfig> = {};
-      mcpServers
+      allServers
         .filter((server: IMcpServer) => server.enabled && server.status === 'connected') // 只使用启用且连接成功的服务器
         .forEach((server: IMcpServer) => {
           if (server.transport.type === 'stdio') {
@@ -245,7 +330,11 @@ export class GeminiAgentManager extends BaseAgentManager<
               env: server.transport.env || {},
               description: server.description,
             };
-          } else if (server.transport.type === 'sse' || server.transport.type === 'http' || server.transport.type === 'streamable_http') {
+          } else if (
+            server.transport.type === 'sse' ||
+            server.transport.type === 'http' ||
+            server.transport.type === 'streamable_http'
+          ) {
             // aioncli-core MCPServerConfig.type only accepts "sse" | "http"
             const type = server.transport.type === 'streamable_http' ? 'http' : server.transport.type;
             mcpConfig[server.name] = {
@@ -257,6 +346,19 @@ export class GeminiAgentManager extends BaseAgentManager<
           }
         });
 
+      // Inject team MCP server if this agent belongs to a team (stdio mode)
+      if (this.teamMcpStdioConfig && this.teamMcpStdioConfig.command) {
+        const envObj: Record<string, string> = {};
+        for (const { name, value } of this.teamMcpStdioConfig.env || []) {
+          envObj[name] = value;
+        }
+        mcpConfig[this.teamMcpStdioConfig.name] = {
+          command: this.teamMcpStdioConfig.command,
+          args: this.teamMcpStdioConfig.args || [],
+          env: envObj,
+        };
+      }
+
       return mcpConfig;
     } catch (error) {
       this.mcpFingerprint = '[]';
@@ -264,7 +366,38 @@ export class GeminiAgentManager extends BaseAgentManager<
     }
   }
 
-  async sendMessage(data: { input: string; msg_id: string; files?: string[]; cronMeta?: CronMessageMeta }) {
+  async sendMessage(data: {
+    input: string;
+    msg_id: string;
+    files?: string[];
+    cronMeta?: CronMessageMeta;
+    hidden?: boolean;
+    silent?: boolean;
+  }) {
+    if (data.silent) {
+      await this.refreshWorkerIfMcpChanged();
+      this.status = 'pending';
+      cronBusyGuard.setProcessing(this.conversation_id, true);
+      await this.bootstrap
+        .catch((e) => {
+          cronBusyGuard.setProcessing(this.conversation_id, false);
+          this.emit('gemini.message', {
+            type: 'error',
+            data: e.message || JSON.stringify(e),
+            msg_id: data.msg_id,
+          });
+          return new Promise((_, reject) => {
+            nextTickToLocalFinish(() => {
+              reject(e);
+            });
+          });
+        })
+        .then(() => super.sendMessage(data))
+        .finally(() => {
+          cronBusyGuard.setProcessing(this.conversation_id, false);
+        });
+      return;
+    }
     const message: TMessage = {
       id: data.msg_id,
       type: 'text',
@@ -274,13 +407,14 @@ export class GeminiAgentManager extends BaseAgentManager<
         content: data.input,
         ...(data.cronMeta && { cronMeta: data.cronMeta }),
       },
+      ...(data.hidden && { hidden: true }),
     };
     addMessage(this.conversation_id, message);
     // Update conversation modifyTime so history list sorts correctly.
     // Without this, chat.history.refresh fires before modifyTime is updated,
     // causing stale sorting until a manual page refresh.
     try {
-      getDatabase().updateConversation(this.conversation_id, {});
+      (await getDatabase()).updateConversation(this.conversation_id, {});
     } catch {
       // Conversation might not exist in DB yet
     }
@@ -293,6 +427,7 @@ export class GeminiAgentManager extends BaseAgentManager<
         conversation_id: this.conversation_id,
         msg_id: data.msg_id,
         data: { content: message.content.content, cronMeta: data.cronMeta },
+        ...(data.hidden && { hidden: true }),
       };
       ipcBridge.geminiConversation.responseStream.emit(userResponseMessage);
     }
@@ -336,7 +471,10 @@ export class GeminiAgentManager extends BaseAgentManager<
       const currentFingerprint = GeminiAgentManager.computeMcpFingerprint(mcpServers);
 
       if (currentFingerprint !== this.mcpFingerprint) {
-        mainLog('[GeminiAgentManager]', `MCP config changed (${this.mcpFingerprint} -> ${currentFingerprint}), re-bootstrapping worker...`);
+        mainLog(
+          '[GeminiAgentManager]',
+          `MCP config changed (${this.mcpFingerprint} -> ${currentFingerprint}), re-bootstrapping worker...`
+        );
         // Kill old worker process and its child processes (MCP server connections)
         this.kill();
         // Re-bootstrap with fresh config (getMcpServers will update the fingerprint)
@@ -350,11 +488,18 @@ export class GeminiAgentManager extends BaseAgentManager<
     }
   }
 
-  private getConfirmationButtons = (confirmationDetails: IMessageToolGroup['content'][number]['confirmationDetails'], t: (key: string, options?: any) => string) => {
+  private getConfirmationButtons = (
+    confirmationDetails: IMessageToolGroup['content'][number]['confirmationDetails'],
+    t: (key: string, options?: any) => string
+  ) => {
     if (!confirmationDetails) return {};
     let question: string;
     let description: string;
-    const options: Array<{ label: string; value: ToolConfirmationOutcome; params?: Record<string, string> }> = [];
+    const options: Array<{
+      label: string;
+      value: ToolConfirmationOutcome;
+      params?: Record<string, string>;
+    }> = [];
     switch (confirmationDetails.type) {
       case 'edit':
         {
@@ -369,7 +514,10 @@ export class GeminiAgentManager extends BaseAgentManager<
               label: t('messages.confirmation.yesAllowAlways'),
               value: ToolConfirmationOutcome.ProceedAlways,
             },
-            { label: t('messages.confirmation.no'), value: ToolConfirmationOutcome.Cancel }
+            {
+              label: t('messages.confirmation.no'),
+              value: ToolConfirmationOutcome.Cancel,
+            }
           );
         }
         break;
@@ -386,7 +534,10 @@ export class GeminiAgentManager extends BaseAgentManager<
               label: t('messages.confirmation.yesAllowAlways'),
               value: ToolConfirmationOutcome.ProceedAlways,
             },
-            { label: t('messages.confirmation.no'), value: ToolConfirmationOutcome.Cancel }
+            {
+              label: t('messages.confirmation.no'),
+              value: ToolConfirmationOutcome.Cancel,
+            }
           );
         }
         break;
@@ -403,7 +554,10 @@ export class GeminiAgentManager extends BaseAgentManager<
               label: t('messages.confirmation.yesAllowAlways'),
               value: ToolConfirmationOutcome.ProceedAlways,
             },
-            { label: t('messages.confirmation.no'), value: ToolConfirmationOutcome.Cancel }
+            {
+              label: t('messages.confirmation.no'),
+              value: ToolConfirmationOutcome.Cancel,
+            }
           );
         }
         break;
@@ -425,7 +579,10 @@ export class GeminiAgentManager extends BaseAgentManager<
               serverName: mcpProps.serverName,
             }),
             value: ToolConfirmationOutcome.ProceedAlwaysTool,
-            params: { toolName: mcpProps.toolName, serverName: mcpProps.serverName },
+            params: {
+              toolName: mcpProps.toolName,
+              serverName: mcpProps.serverName,
+            },
           },
           {
             label: t('messages.confirmation.yesAlwaysAllowServer', {
@@ -434,7 +591,10 @@ export class GeminiAgentManager extends BaseAgentManager<
             value: ToolConfirmationOutcome.ProceedAlwaysServer,
             params: { serverName: mcpProps.serverName },
           },
-          { label: t('messages.confirmation.no'), value: ToolConfirmationOutcome.Cancel }
+          {
+            label: t('messages.confirmation.no'),
+            value: ToolConfirmationOutcome.Cancel,
+          }
         );
       }
     }
@@ -450,7 +610,9 @@ export class GeminiAgentManager extends BaseAgentManager<
    */
   private tryAutoApprove(content: IMessageToolGroup['content'][number]): boolean {
     const type = content.confirmationDetails?.type;
-    console.log(`[GeminiAgentManager] tryAutoApprove: currentMode=${this.currentMode}, confirmationType=${type}, callId=${content.callId}`);
+    console.log(
+      `[GeminiAgentManager] tryAutoApprove: currentMode=${this.currentMode}, confirmationType=${type}, callId=${content.callId}`
+    );
     if (this.currentMode === 'yolo') {
       // yolo: auto-approve ALL operations
       console.log(`[GeminiAgentManager] YOLO auto-approving ${type}: callId=${content.callId}`);
@@ -489,15 +651,24 @@ export class GeminiAgentManager extends BaseAgentManager<
             description: content.description || content.name || 'Tool requires confirmation',
             callId: content.callId,
             options: [
-              { label: 'messages.confirmation.yesAllowOnce', value: ToolConfirmationOutcome.ProceedOnce },
-              { label: 'messages.confirmation.no', value: ToolConfirmationOutcome.Cancel },
+              {
+                label: 'messages.confirmation.yesAllowOnce',
+                value: ToolConfirmationOutcome.ProceedOnce,
+              },
+              {
+                label: 'messages.confirmation.no',
+                value: ToolConfirmationOutcome.Cancel,
+              },
             ],
           });
           return;
         }
         if (!question || !hasOptions) return;
         // Extract commandType from exec confirmations for "always allow" memory
-        const commandType = content.confirmationDetails?.type === 'exec' ? (content.confirmationDetails as { rootCommand?: string }).rootCommand : undefined;
+        const commandType =
+          content.confirmationDetails?.type === 'exec'
+            ? (content.confirmationDetails as { rootCommand?: string }).rootCommand
+            : undefined;
         this.addConfirmation({
           title: content.confirmationDetails?.title || '',
           id: content.callId,
@@ -526,6 +697,15 @@ export class GeminiAgentManager extends BaseAgentManager<
         // When stream finishes, check for cron commands in the accumulated message
         // Use longer delay and retry logic to ensure message is persisted
         this.checkCronWithRetry(0);
+        // Check for SKILL_SUGGEST.md updates (registered by cron executor)
+        skillSuggestWatcher.onFinish(this.conversation_id);
+        // Finalize thinking message with done status
+        if (this.thinkingMsgId) {
+          this.emitThinkingMessage('', 'done');
+          this.thinkingMsgId = null;
+          this.thinkingStartTime = null;
+          this.thinkingContent = '';
+        }
       }
       if (data.type === 'start') {
         this.status = 'running';
@@ -553,11 +733,26 @@ export class GeminiAgentManager extends BaseAgentManager<
       }
 
       data.conversation_id = this.conversation_id;
+
+      // Convert thought events to thinking messages in conversation flow
+      if (data.type === 'thought') {
+        const thoughtData = data.data as { subject?: string; description?: string } | string;
+        const content =
+          typeof thoughtData === 'string' ? thoughtData : thoughtData?.description || thoughtData?.subject || '';
+        if (content) {
+          this.emitThinkingMessage(content, 'thinking');
+        }
+      } else if (this.thinkingMsgId) {
+        // Any non-thought message means thinking phase is over
+        this.emitThinkingMessage('', 'done');
+        this.thinkingMsgId = null;
+        this.thinkingStartTime = null;
+        this.thinkingContent = '';
+      }
+
       // Transform and persist message (skip transient UI state messages)
-      // 跳过 thought, finished 等不需要持久化的消息类型
-      // Skip transient UI state messages that don't need persistence
-      // 跳过不需要持久化的临时 UI 状态消息 (thought, finished, start, finish)
-      const skipTransformTypes = ['thought', 'finished', 'start', 'finish'];
+      // Skip thought (now handled as thinking above), thinking, finished, start, finish
+      const skipTransformTypes = ['thought', 'thinking', 'finished', 'start', 'finish'];
       if (!skipTransformTypes.includes(data.type)) {
         const tMessage = transformMessage(data as IResponseMessage);
         if (tMessage) {
@@ -568,12 +763,26 @@ export class GeminiAgentManager extends BaseAgentManager<
         }
       }
 
+      // Strip inline <think> tags from content messages to prevent leaking
+      // internal reasoning to the UI (e.g. models that embed think tags in content)
+      if (data.type === 'content' && typeof data.data === 'string') {
+        const { thinking, content: stripped } = extractAndStripThinkTags(data.data);
+        if (thinking) {
+          this.emitThinkingMessage(thinking, 'thinking');
+        }
+        if (stripped !== data.data) {
+          data = { ...data, data: stripped };
+        }
+      }
+
       // Filter think tags from streaming content before emitting to UI
-      // 在发送到 UI 前过滤流式内容中的 think 标签
       const filteredData = this.filterThinkTagsFromMessage(data);
       ipcBridge.geminiConversation.responseStream.emit(filteredData);
 
-      // 发送到 Channel 全局事件总线（用于 Telegram 等外部平台）
+      // Also emit to main-process-local bus so TeammateManager (same process)
+      // can receive events — ipcBridge.emit only delivers to renderer via webContents.send()
+      teamEventBus.emit('responseStream', filteredData);
+
       // Emit to Channel global event bus (for Telegram and other external platforms)
       channelEventBus.emitAgentMessage(this.conversation_id, filteredData);
     });
@@ -614,8 +823,8 @@ export class GeminiAgentManager extends BaseAgentManager<
    */
   private async checkCronCommandsOnFinish(afterTimestamp: number): Promise<boolean> {
     try {
-      const { getDatabase } = await import('@process/database');
-      const db = getDatabase();
+      const { getDatabase } = await import('@process/services/database');
+      const db = await getDatabase();
       const result = db.getConversationMessages(this.conversation_id, 0, 20, 'DESC');
 
       if (!result.data || result.data.length === 0) {
@@ -733,9 +942,9 @@ export class GeminiAgentManager extends BaseAgentManager<
    * Save session mode to database for resume support.
    * 保存会话模式到数据库以支持恢复。
    */
-  private saveSessionMode(mode: string): void {
+  private async saveSessionMode(mode: string): Promise<void> {
     try {
-      const db = getDatabase();
+      const db = await getDatabase();
       const result = db.getConversation(this.conversation_id);
       if (result.success && result.data && result.data.type === 'gemini') {
         const conversation = result.data;
@@ -743,7 +952,9 @@ export class GeminiAgentManager extends BaseAgentManager<
           ...conversation.extra,
           sessionMode: mode,
         };
-        db.updateConversation(this.conversation_id, { extra: updatedExtra } as Partial<typeof conversation>);
+        db.updateConversation(this.conversation_id, {
+          extra: updatedExtra,
+        } as Partial<typeof conversation>);
       }
     } catch (error) {
       mainError('[GeminiAgentManager]', 'Failed to save session mode', error);
@@ -759,7 +970,10 @@ export class GeminiAgentManager extends BaseAgentManager<
     try {
       const config = await ProcessConfig.get('gemini.config');
       if (config?.yoloMode) {
-        await ProcessConfig.set('gemini.config', { ...config, yoloMode: false });
+        await ProcessConfig.set('gemini.config', {
+          ...config,
+          yoloMode: false,
+        });
       }
     } catch (error) {
       mainError('[GeminiAgentManager]', 'Failed to clear legacy yoloMode config', error);
@@ -786,6 +1000,70 @@ export class GeminiAgentManager extends BaseAgentManager<
   // Manually trigger context reload
   async reloadContext(): Promise<void> {
     await this.injectHistoryFromDatabase();
+  }
+
+  /**
+   * Emit a thinking message to the UI stream.
+   * Creates a new thinking msg_id on first call per turn, reuses it for subsequent calls.
+   */
+  private emitThinkingMessage(content: string, status: 'thinking' | 'done' = 'thinking'): void {
+    if (!this.thinkingMsgId) {
+      this.thinkingMsgId = uuid();
+      this.thinkingStartTime = Date.now();
+      this.thinkingContent = '';
+    }
+
+    // Accumulate content during streaming
+    if (status === 'thinking') {
+      this.thinkingContent += content;
+    }
+
+    const duration = status === 'done' && this.thinkingStartTime ? Date.now() - this.thinkingStartTime : undefined;
+
+    const thinkingMessage = {
+      type: 'thinking',
+      conversation_id: this.conversation_id,
+      msg_id: this.thinkingMsgId,
+      data: {
+        content,
+        duration,
+        status,
+      },
+    };
+
+    ipcBridge.geminiConversation.responseStream.emit(thinkingMessage);
+    channelEventBus.emitAgentMessage(this.conversation_id, thinkingMessage);
+
+    // Persist: done flushes immediately, streaming chunks use buffered timer
+    if (status === 'done') {
+      this.flushThinkingToDb(duration, 'done');
+    } else if (!this.thinkingDbFlushTimer) {
+      this.thinkingDbFlushTimer = setTimeout(() => {
+        this.flushThinkingToDb(undefined, 'thinking');
+      }, this.thinkingDbFlushIntervalMs);
+    }
+  }
+
+  private flushThinkingToDb(duration: number | undefined, status: 'thinking' | 'done'): void {
+    if (this.thinkingDbFlushTimer) {
+      clearTimeout(this.thinkingDbFlushTimer);
+      this.thinkingDbFlushTimer = null;
+    }
+    if (!this.thinkingMsgId) return;
+    const tMessage: TMessage = {
+      id: this.thinkingMsgId,
+      msg_id: this.thinkingMsgId,
+      type: 'thinking',
+      position: 'left',
+      conversation_id: this.conversation_id,
+      content: {
+        content: this.thinkingContent,
+        duration,
+        status,
+      },
+      createdAt: this.thinkingStartTime || Date.now(),
+    };
+    addOrUpdateMessage(this.conversation_id, tMessage, 'gemini');
   }
 
   /**

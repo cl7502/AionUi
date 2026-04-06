@@ -5,7 +5,13 @@
  */
 
 import { describe, expect, it } from 'vitest';
-import { hasThinkTags, stripThinkTags, extractThinkContent } from '@/process/task/ThinkTagDetector';
+import {
+  hasThinkTags,
+  stripThinkTags,
+  extractThinkContent,
+  extractAndStripThinkTags,
+} from '@process/task/ThinkTagDetector';
+import { stripThinkTags as stripRendererThinkTags } from '@/renderer/utils/chat/thinkTagFilter';
 
 describe('ThinkTagDetector', () => {
   describe('hasThinkTags', () => {
@@ -113,10 +119,10 @@ After`;
       expect(result).toContain('some text');
     });
 
-    it('should collapse multiple newlines', () => {
+    it('should leave newline-only content unchanged when no think tags are present', () => {
       const input = 'Hello\n\n\n\nworld';
-      const expected = 'Hello\n\nworld';
-      expect(stripThinkTags(input)).toBe(expected);
+      expect(stripThinkTags(input)).toBe(input);
+      expect(stripRendererThinkTags(input)).toBe(input);
     });
 
     it('should handle mixed think and thinking tags', () => {
@@ -142,6 +148,22 @@ After`;
     it('should handle content with no think tags', () => {
       const input = 'This is normal text without any tags';
       expect(stripThinkTags(input)).toBe(input);
+    });
+
+    it('should preserve markdown spacing for content without think tags', () => {
+      const input =
+        '现在这轮子进程看起来还可以。\n\n当前服务：\n- `aionui-webui.service` 已运行约 15 分钟\n- 主进程 `dist-server/server.mjs` PID `182448`';
+
+      expect(stripThinkTags(input)).toBe(input);
+      expect(stripRendererThinkTags(input)).toBe(input);
+    });
+
+    it('should preserve list-leading newlines after removing think tags', () => {
+      const input = '<think>internal</think>\n\n当前服务：\n- `aionui-webui.service` 已运行约 15 分钟';
+      const expected = '\n\n当前服务：\n- `aionui-webui.service` 已运行约 15 分钟';
+
+      expect(stripThinkTags(input)).toBe(expected);
+      expect(stripRendererThinkTags(input)).toBe(expected);
     });
   });
 
@@ -184,6 +206,55 @@ Line 2
       expect(extractThinkContent('')).toEqual([]);
       expect(extractThinkContent(null as unknown as string)).toEqual([]);
       expect(extractThinkContent(undefined as unknown as string)).toEqual([]);
+    });
+  });
+
+  describe('extractAndStripThinkTags', () => {
+    it('should extract thinking content and return stripped content', () => {
+      const input = '<think>reasoning here</think>actual response';
+      const result = extractAndStripThinkTags(input);
+      expect(result.thinking).toBe('reasoning here');
+      expect(result.content).toBe('actual response');
+    });
+
+    it('should handle <thinking> tags', () => {
+      const input = '<thinking>deep thought</thinking>answer';
+      const result = extractAndStripThinkTags(input);
+      expect(result.thinking).toBe('deep thought');
+      expect(result.content).toBe('answer');
+    });
+
+    it('should handle multiple think blocks', () => {
+      const input = '<think>first</think>middle<think>second</think>end';
+      const result = extractAndStripThinkTags(input);
+      expect(result.thinking).toBe('first\n\nsecond');
+      expect(result.content).toBe('middleend');
+    });
+
+    it('should return empty thinking when no tags present', () => {
+      const input = 'no thinking here';
+      const result = extractAndStripThinkTags(input);
+      expect(result.thinking).toBe('');
+      expect(result.content).toBe('no thinking here');
+    });
+
+    it('should handle MiniMax-style orphaned closing tag', () => {
+      const input = 'internal reasoning\n</think>\nthe real answer';
+      const result = extractAndStripThinkTags(input);
+      expect(result.thinking).toBe('internal reasoning');
+      expect(result.content).toBe('\nthe real answer');
+    });
+
+    it('should preserve markdown-leading blank lines when extracting think tags', () => {
+      const input = '<think>internal reasoning</think>\n\n当前服务：\n- `aionui-webui.service` 已运行约 15 分钟';
+      const result = extractAndStripThinkTags(input);
+      expect(result.thinking).toBe('internal reasoning');
+      expect(result.content).toBe('\n\n当前服务：\n- `aionui-webui.service` 已运行约 15 分钟');
+    });
+
+    it('should handle empty/null input', () => {
+      expect(extractAndStripThinkTags('')).toEqual({ thinking: '', content: '' });
+      expect(extractAndStripThinkTags(null as unknown as string)).toEqual({ thinking: '', content: '' });
     });
   });
 
@@ -242,7 +313,11 @@ The solution involves implementing the following steps:
       // Chunk 1: "I need to analyze..." (no tags, passed through)
       // Chunk 2: "Let me think...\n" (no tags, passed through)
       // Chunk 3: "</think>\n\nHere's my answer" (orphaned </think> preserved)
-      const accumulated = "I need to analyze the user's request.\n" + 'Let me think about this carefully.\n' + "</think>\n\nHere's my answer:\n" + 'The solution is X.';
+      const accumulated =
+        "I need to analyze the user's request.\n" +
+        'Let me think about this carefully.\n' +
+        "</think>\n\nHere's my answer:\n" +
+        'The solution is X.';
 
       const result = stripThinkTags(accumulated);
       expect(result).not.toContain('I need to analyze');
@@ -256,7 +331,8 @@ The solution involves implementing the following steps:
       // When text messages get concatenated across tool calls, there may be
       // actual response content between two </think> tags that must be preserved.
       // Strategy: strip content before FIRST </think>, then remove remaining </think> tags only.
-      const input = 'thinking about approach\n</think>\nresponse part 1\nthinking about step 2\n</think>\nresponse part 2';
+      const input =
+        'thinking about approach\n</think>\nresponse part 1\nthinking about step 2\n</think>\nresponse part 2';
 
       const result = stripThinkTags(input);
       expect(result).not.toContain('</think>');
@@ -287,7 +363,8 @@ The solution involves implementing the following steps:
 
     it('should preserve markdown code blocks between orphaned </think> tags', () => {
       // Real-world scenario: AI thinking + response with code + more thinking
-      const input = 'Investigating...\n</think>\n\n基本用法\n```tsx\nimport { Collapse }\n```\n\nmore thinking\n</think>\n\n更多用法';
+      const input =
+        'Investigating...\n</think>\n\n基本用法\n```tsx\nimport { Collapse }\n```\n\nmore thinking\n</think>\n\n更多用法';
 
       const result = stripThinkTags(input);
       expect(result).not.toContain('</think>');

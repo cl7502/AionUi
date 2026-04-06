@@ -1,5 +1,6 @@
 import { defineConfig, externalizeDepsPlugin } from 'electron-vite';
 import { resolve } from 'path';
+import { sentryVitePlugin } from '@sentry/vite-plugin';
 import UnoCSS from 'unocss/vite';
 import unoConfig from './uno.config.ts';
 import { viteStaticCopy } from 'vite-plugin-static-copy';
@@ -12,14 +13,20 @@ function iconParkPlugin() {
     transform(source: string, id: string) {
       if (!id.endsWith('.tsx') || id.includes('node_modules')) return null;
       if (!source.includes('@icon-park/react')) return null;
-      const transformedSource = source.replace(/import\s+\{\s+([a-zA-Z, ]*)\s+\}\s+from\s+['"]@icon-park\/react['"](;?)/g, function (str, match) {
-        if (!match) return str;
-        const components = match.split(',');
-        const importComponent = str.replace(match, components.map((key: string) => `${key} as _${key.trim()}`).join(', '));
-        const hoc = `import IconParkHOC from '@renderer/components/IconParkHOC';
+      const transformedSource = source.replace(
+        /import\s+\{\s+([a-zA-Z, ]*)\s+\}\s+from\s+['"]@icon-park\/react['"](;?)/g,
+        function (str, match) {
+          if (!match) return str;
+          const components = match.split(',');
+          const importComponent = str.replace(
+            match,
+            components.map((key: string) => `${key} as _${key.trim()}`).join(', ')
+          );
+          const hoc = `import IconParkHOC from '@renderer/components/IconParkHOC';
           ${components.map((key: string) => `const ${key.trim()} = IconParkHOC(_${key.trim()})`).join(';\n')}`;
-        return importComponent + ';' + hoc;
-      });
+          return importComponent + ';' + hoc;
+        }
+      );
       if (transformedSource !== source) return { code: transformedSource, map: null } as { code: string; map: null };
       return null;
     },
@@ -32,12 +39,27 @@ const mainAliases = {
   '@common': resolve('src/common'),
   '@renderer': resolve('src/renderer'),
   '@process': resolve('src/process'),
-  '@worker': resolve('src/worker'),
-  '@xterm/headless': resolve('src/shims/xterm-headless.ts'),
+  '@worker': resolve('src/process/worker'),
+  '@xterm/headless': resolve('src/common/utils/shims/xterm-headless.ts'),
 };
 
 export default defineConfig(({ mode }) => {
   const isDevelopment = mode === 'development';
+  const enableSentrySourceMaps = !isDevelopment && !!process.env.SENTRY_AUTH_TOKEN;
+
+  const sentryPluginOptions = {
+    org: process.env.SENTRY_ORG,
+    project: process.env.SENTRY_PROJECT,
+    authToken: process.env.SENTRY_AUTH_TOKEN,
+    sourcemaps: {
+      filesToDeleteAfterUpload: ['./out/**/*.map'],
+      rewriteSources: (source: string) => {
+        // Normalize Windows backslashes and strip leading relative prefixes
+        // so Sentry paths match the GitHub repo structure (e.g. src/process/...)
+        return source.replace(/\\/g, '/').replace(/^(\.\.\/)+(src\/)/, '$2');
+      },
+    },
+  };
 
   return {
     main: {
@@ -49,19 +71,24 @@ export default defineConfig(({ mode }) => {
           ? [
               viteStaticCopy({
                 structured: false,
+                // electron-vite builds main process as SSR; viteStaticCopy defaults
+                // to environment: "client" and silently skips non-client environments.
+                environment: 'ssr',
                 targets: [
-                  { src: 'skills/**', dest: 'skills' },
-                  { src: 'rules/**', dest: 'rules' },
-                  { src: 'assistant/**', dest: 'assistant' },
-                  { src: 'src/renderer/assets/logos/**', dest: 'static/images' },
+                  // Use single * glob to copy top-level items (directories) with their contents intact.
+                  // Using ** would flatten all nested files into the dest root.
+                  { src: 'src/process/resources/skills/*', dest: 'skills' },
+                  { src: 'src/process/resources/assistant/*', dest: 'assistant' },
+                  { src: 'src/renderer/assets/logos/*', dest: 'static/images' },
                 ],
               }),
             ]
           : []),
+        ...(enableSentrySourceMaps ? [sentryVitePlugin(sentryPluginOptions)] : []),
       ],
       resolve: { alias: mainAliases, extensions: ['.ts', '.tsx', '.js', '.json'] },
       build: {
-        sourcemap: false,
+        sourcemap: enableSentrySourceMaps ? 'hidden' : false,
         reportCompressedSize: false,
         rollupOptions: {
           input: {
@@ -69,11 +96,14 @@ export default defineConfig(({ mode }) => {
             // Worker entry files are output alongside index.js in out/main/.
             // BaseAgentManager.resolveWorkerDir() handles the case where code
             // splitting places it in a chunks/ subdirectory.
-            gemini: resolve('src/worker/gemini.ts'),
-            acp: resolve('src/worker/acp.ts'),
-            codex: resolve('src/worker/codex.ts'),
-            'openclaw-gateway': resolve('src/worker/openclaw-gateway.ts'),
-            nanobot: resolve('src/worker/nanobot.ts'),
+            gemini: resolve('src/process/worker/gemini.ts'),
+            acp: resolve('src/process/worker/acp.ts'),
+            'openclaw-gateway': resolve('src/process/worker/openclaw-gateway.ts'),
+            nanobot: resolve('src/process/worker/nanobot.ts'),
+            lifecycleRunner: resolve('src/process/extensions/lifecycle/lifecycleRunner.ts'),
+            aionrs: resolve('src/process/worker/aionrs.ts'),
+            // Built-in MCP server entry points
+            'builtin-mcp-image-gen': resolve('src/process/resources/builtinMcp/imageGenServer.ts'),
           },
           onwarn(warning, warn) {
             if (warning.code === 'EVAL') return;
@@ -81,7 +111,11 @@ export default defineConfig(({ mode }) => {
           },
         },
       },
-      define: { 'process.env.env': JSON.stringify(process.env.env) },
+      define: {
+        'process.env.NODE_ENV': JSON.stringify(mode),
+        'process.env.env': JSON.stringify(process.env.env),
+        'process.env.SENTRY_DSN': JSON.stringify(process.env.SENTRY_DSN ?? ''),
+      },
     },
 
     preload: {
@@ -99,12 +133,17 @@ export default defineConfig(({ mode }) => {
 
     renderer: {
       base: './',
+      publicDir: resolve('public'),
       server: {
-        // Explicit HMR config so Vite client connects directly to the Vite dev server,
-        // not to the WebUI proxy server (which would reject the WebSocket and cause infinite reload)
+        // Default to 5173; when occupied (e.g. another AionUi clone is running),
+        // Vite auto-increments to the next available port.
+        // electron-vite reads the actual port and sets ELECTRON_RENDERER_URL accordingly.
+        port: 5173,
+        // Explicit HMR host so Vite client connects directly to the Vite dev server,
+        // not to the WebUI proxy server (which would reject the WebSocket and cause infinite reload).
+        // Port is omitted so it automatically matches the server port.
         hmr: {
           host: 'localhost',
-          port: 5173,
         },
       },
       resolve: {
@@ -113,17 +152,21 @@ export default defineConfig(({ mode }) => {
           '@common': resolve('src/common'),
           '@renderer': resolve('src/renderer'),
           '@process': resolve('src/process'),
-          '@worker': resolve('src/worker'),
+          '@worker': resolve('src/process/worker'),
           // Force ESM version of streamdown
           streamdown: resolve('node_modules/streamdown/dist/index.js'),
         },
         extensions: ['.ts', '.tsx', '.js', '.jsx', '.css'],
         dedupe: ['react', 'react-dom', 'react-router-dom'],
       },
-      plugins: [UnoCSS(unoConfig), iconParkPlugin()],
+      plugins: [
+        UnoCSS(unoConfig),
+        iconParkPlugin(),
+        ...(enableSentrySourceMaps ? [sentryVitePlugin(sentryPluginOptions)] : []),
+      ],
       build: {
         target: 'es2022',
-        sourcemap: isDevelopment,
+        sourcemap: enableSentrySourceMaps ? 'hidden' : isDevelopment,
         minify: !isDevelopment,
         reportCompressedSize: false,
         chunkSizeWarningLimit: 1500,
@@ -131,14 +174,38 @@ export default defineConfig(({ mode }) => {
         rollupOptions: {
           input: { index: resolve('src/renderer/index.html') },
           external: ['node:crypto', 'crypto'],
+          onwarn(warning, warn) {
+            if (warning.code === 'EVAL') return;
+            warn(warning);
+          },
           output: {
             manualChunks(id: string) {
               if (!id.includes('node_modules')) return undefined;
               if (id.includes('/react-dom/') || id.includes('/react/')) return 'vendor-react';
               if (id.includes('/@arco-design/')) return 'vendor-arco';
-              if (id.includes('/react-markdown/') || id.includes('/remark-') || id.includes('/rehype-') || id.includes('/unified/') || id.includes('/mdast-') || id.includes('/hast-') || id.includes('/micromark')) return 'vendor-markdown';
-              if (id.includes('/react-syntax-highlighter/') || id.includes('/refractor/') || id.includes('/highlight.js/')) return 'vendor-highlight';
-              if (id.includes('/monaco-editor/') || id.includes('/@monaco-editor/') || id.includes('/codemirror/') || id.includes('/@codemirror/')) return 'vendor-editor';
+              if (
+                id.includes('/react-markdown/') ||
+                id.includes('/remark-') ||
+                id.includes('/rehype-') ||
+                id.includes('/unified/') ||
+                id.includes('/mdast-') ||
+                id.includes('/hast-') ||
+                id.includes('/micromark')
+              )
+                return 'vendor-markdown';
+              if (
+                id.includes('/react-syntax-highlighter/') ||
+                id.includes('/refractor/') ||
+                id.includes('/highlight.js/')
+              )
+                return 'vendor-highlight';
+              if (
+                id.includes('/monaco-editor/') ||
+                id.includes('/@monaco-editor/') ||
+                id.includes('/codemirror/') ||
+                id.includes('/@codemirror/')
+              )
+                return 'vendor-editor';
               if (id.includes('/katex/')) return 'vendor-katex';
               if (id.includes('/@icon-park/')) return 'vendor-icons';
               if (id.includes('/diff2html/')) return 'vendor-diff';
@@ -148,12 +215,36 @@ export default defineConfig(({ mode }) => {
         },
       },
       define: {
+        'process.env.NODE_ENV': JSON.stringify(mode),
         'process.env.env': JSON.stringify(process.env.env),
+        'process.env.AIONUI_MULTI_INSTANCE': JSON.stringify(process.env.AIONUI_MULTI_INSTANCE ?? ''),
+        'process.env.SENTRY_DSN': JSON.stringify(process.env.SENTRY_DSN ?? ''),
         global: 'globalThis',
       },
       optimizeDeps: {
         exclude: ['electron'],
-        include: ['react', 'react-dom', 'react-router-dom', 'react-i18next', 'i18next', '@arco-design/web-react', '@icon-park/react', 'react-markdown', 'react-syntax-highlighter', 'react-virtuoso', 'classnames', 'swr', 'eventemitter3', 'katex', 'diff2html', 'remark-gfm', 'remark-math', 'remark-breaks', 'rehype-raw', 'rehype-katex'],
+        include: [
+          'react',
+          'react-dom',
+          'react-router-dom',
+          'react-i18next',
+          'i18next',
+          '@arco-design/web-react',
+          '@icon-park/react',
+          'react-markdown',
+          'react-syntax-highlighter',
+          'react-virtuoso',
+          'classnames',
+          'swr',
+          'eventemitter3',
+          'katex',
+          'diff2html',
+          'remark-gfm',
+          'remark-math',
+          'remark-breaks',
+          'rehype-raw',
+          'rehype-katex',
+        ],
       },
     },
   };

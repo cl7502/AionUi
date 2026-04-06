@@ -1,34 +1,66 @@
-name: '✓PR Checks'
+name: 'PR Checks'
 
 on:
+  workflow_dispatch:
+    inputs:
+      pr_number:
+        description: 'PR number to run checks on'
+        required: true
+        type: string
+      skip_build_test:
+        description: 'Skip the build test job (saves ~45 min)'
+        type: boolean
+        required: false
+        default: false
   pull_request:
-    types: [opened, synchronize, edited]
+    types: [opened, synchronize, edited, closed, ready_for_review]
     branches: [main, dev]
+    paths-ignore:
+      - '**/*.md'
+      - 'docs/**'
+      - '.vscode/**'
+      - '.github/ISSUE_TEMPLATE/**'
 
 concurrency:
-  group: pr-checks-${{ github.event.pull_request.number }}
+  group: pr-checks-${{ github.event.pull_request.number || inputs.pr_number }}
   cancel-in-progress: true
 
 permissions:
   contents: read
   pull-requests: write
   issues: read
+  checks: write
+  id-token: write
 
 env:
   BUN_INSTALL_REGISTRY: 'https://registry.npmjs.org/'
 
 jobs:
-  # Job 1: Code quality checks (TypeScript, ESLint, Prettier)
+  # Cancel in-progress runs when PR is closed (merged or manually closed)
+  cancel-if-closed:
+    name: Cancel if PR closed
+    if: github.event.action == 'closed'
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo "PR closed, cancelling in-progress runs via concurrency."
+
+  # Job 1: Code quality checks (TypeScript, Oxlint, Oxfmt)
   code-quality:
     name: Code Quality
-    if: github.event.action != 'edited'
+    if: github.event_name == 'workflow_dispatch' || (github.event.action != 'closed' && github.event.pull_request.draft == false)
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
       - name: Checkout code
-        uses: actions/checkout@v6
+        uses: actions/checkout@v4
         with:
           fetch-depth: 0
+
+      - name: Resolve PR context
+        uses: ./.github/actions/checkout-pr
+        with:
+          pr_number: ${{ inputs.pr_number }}
+          github_token: ${{ github.token }}
 
       - name: Setup Node.js
         uses: actions/setup-node@v4
@@ -39,9 +71,10 @@ jobs:
         uses: oven-sh/setup-bun@v2
         with:
           bun-version: latest
+          cache: true
 
       - name: Install dependencies
-        run: bun install --no-frozen-lockfile
+        run: bun install --frozen-lockfile
 
       - name: Run postinstall
         run: npm run postinstall || true
@@ -50,12 +83,12 @@ jobs:
         run: npm install -g @j178/prek
 
       - name: Run prek checks
-        run: prek run --from-ref origin/${{ github.base_ref }} --to-ref HEAD
+        run: prek run --from-ref origin/${{ env.PR_BASE_REF }} --to-ref HEAD
 
   # Job 2: Unit tests across all platforms
   unit-tests:
     name: Unit Tests (${{ matrix.os }})
-    if: github.event.action != 'edited'
+    if: github.event_name == 'workflow_dispatch' || (github.event.action != 'closed' && github.event.pull_request.draft == false)
     runs-on: ${{ matrix.os }}
     timeout-minutes: 10
     strategy:
@@ -64,7 +97,13 @@ jobs:
         os: [ubuntu-latest, macos-14, windows-2022]
     steps:
       - name: Checkout code
-        uses: actions/checkout@v6
+        uses: actions/checkout@v4
+
+      - name: Resolve PR context
+        uses: ./.github/actions/checkout-pr
+        with:
+          pr_number: ${{ inputs.pr_number }}
+          github_token: ${{ github.token }}
 
       - name: Setup Node.js
         uses: actions/setup-node@v4
@@ -75,9 +114,17 @@ jobs:
         uses: oven-sh/setup-bun@v2
         with:
           bun-version: latest
+          cache: true
+
+      - name: Disable Windows Defender (Windows only)
+        if: matrix.os == 'windows-2022'
+        shell: pwsh
+        run: |
+          Set-MpPreference -DisableRealtimeMonitoring $true
+          Add-MpPreference -ExclusionPath "${{ github.workspace }}"
 
       - name: Install dependencies
-        run: bun install --no-frozen-lockfile
+        run: bun install --frozen-lockfile
 
       - name: Run postinstall
         run: npm run postinstall || true
@@ -85,12 +132,147 @@ jobs:
       - name: Run extension system tests
         run: bunx vitest run
 
-  # Job 3: Build test across all platforms (parallel with code-quality and unit-tests)
+  # Job 3: Coverage test (Linux only)
+  coverage-tests:
+    name: Coverage Test
+    if: github.event_name == 'workflow_dispatch' || (github.event.action != 'closed' && github.event.pull_request.draft == false)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Resolve PR context
+        uses: ./.github/actions/checkout-pr
+        with:
+          pr_number: ${{ inputs.pr_number }}
+          github_token: ${{ github.token }}
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: Setup bun
+        uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+          cache: true
+
+      - name: Install dependencies
+        run: bun install --frozen-lockfile
+
+      - name: Run postinstall
+        run: npm run postinstall || true
+
+      - name: Run coverage tests
+        id: coverage
+        continue-on-error: true
+        run: bun run test:coverage
+
+      - name: Upload coverage to Codecov (Linux coverage only)
+        if: always() && hashFiles('coverage/lcov.info') != '' && github.repository == 'iOfficeAI/AionUi'
+        uses: codecov/codecov-action@v5
+        with:
+          token: ${{ secrets.CODECOV_TOKEN }}
+          use_oidc: ${{ secrets.CODECOV_TOKEN == '' }}
+          files: coverage/lcov.info
+          fail_ci_if_error: false
+          verbose: true
+      - name: Skip Codecov upload when preconditions are not met
+        if: always() && hashFiles('coverage/lcov.info') != '' && github.repository != 'iOfficeAI/AionUi'
+        shell: bash
+        run: |
+          echo 'Skipping Codecov upload due to unmet preconditions.'
+          echo "Repository: ${{ github.repository }}"
+      - name: Coverage result summary
+        if: always()
+        shell: bash
+        run: |
+          if [ "${{ steps.coverage.outcome }}" = "failure" ]; then
+            echo "::warning::Coverage tests failed (non-blocking). Check logs for failed test details."
+            echo "## Coverage check (non-blocking warning)" >> $GITHUB_STEP_SUMMARY
+            echo "Coverage command failed in this run. Please review test failures in logs." >> $GITHUB_STEP_SUMMARY
+            if [ -f coverage/lcov.info ]; then
+              echo "lcov.info exists, Codecov upload can still run." >> $GITHUB_STEP_SUMMARY
+            else
+              echo "lcov.info not found, Codecov upload was skipped." >> $GITHUB_STEP_SUMMARY
+            fi
+          else
+            echo "## Coverage check" >> $GITHUB_STEP_SUMMARY
+            echo "Coverage command passed." >> $GITHUB_STEP_SUMMARY
+            if [ -f coverage/lcov.info ]; then
+              echo "Uploaded Linux (ubuntu-latest) coverage to Codecov." >> $GITHUB_STEP_SUMMARY
+            else
+              echo "Coverage passed but lcov.info is missing; Codecov upload was skipped." >> $GITHUB_STEP_SUMMARY
+            fi
+          fi
+
+      - name: Upload coverage artifacts
+        if: always() && hashFiles('coverage/lcov.info') != ''
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-report
+          path: coverage/
+          if-no-files-found: warn
+
+  i18n-check:
+    name: I18n Check
+    if: github.event_name == 'workflow_dispatch' || (github.event.action != 'closed' && github.event.pull_request.draft == false)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: Setup bun
+        uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+          cache: true
+
+      - name: Install dependencies
+        run: bun install --frozen-lockfile
+
+      - name: Run postinstall
+        run: npm run postinstall || true
+
+      - name: Run i18n validation (warning-only)
+        id: i18n
+        shell: bash
+        run: |
+          set -o pipefail
+          node scripts/check-i18n.js 2>&1 | tee i18n-check.log
+
+      - name: Publish i18n summary
+        if: always()
+        shell: bash
+        run: |
+          echo "## i18n validation" >> $GITHUB_STEP_SUMMARY
+          if grep -q "⚠️" i18n-check.log; then
+            echo "Missing/incomplete translations found. Please review warnings below." >> $GITHUB_STEP_SUMMARY
+          else
+            echo "No i18n warnings detected." >> $GITHUB_STEP_SUMMARY
+          fi
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "<details><summary>i18n log</summary>" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo '```text' >> $GITHUB_STEP_SUMMARY
+          cat i18n-check.log >> $GITHUB_STEP_SUMMARY
+          echo '```' >> $GITHUB_STEP_SUMMARY
+          echo "</details>" >> $GITHUB_STEP_SUMMARY
+
+  # Job 4: Build test across all platforms (parallel with code-quality and unit-tests)
   build-test:
     name: Build Test (${{ matrix.platform }})
-    if: github.event.action != 'edited'
+    if: github.event.action != 'closed' && github.event.pull_request.draft == false && inputs.skip_build_test != true
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 30
+    timeout-minutes: 45
     strategy:
       fail-fast: false
       matrix:
@@ -100,30 +282,35 @@ jobs:
             arch: 'arm64'
             target: '--mac'
             build_args: '--mac --arm64'
+            unpacked_dir: 'mac-arm64'
           - platform: 'macos-x64'
             os: 'macos-14'
             arch: 'x64'
             target: '--mac'
             build_args: '--mac --x64'
+            unpacked_dir: 'mac'
           - platform: 'windows-x64'
             os: 'windows-2022'
             arch: 'x64'
             target: '--win'
             build_args: '--win --x64'
+            unpacked_dir: 'win-unpacked'
           - platform: 'windows-arm64'
             os: 'windows-2022'
             arch: 'arm64'
             target: '--win'
             build_args: '--win --arm64'
+            unpacked_dir: 'win-arm64-unpacked'
           - platform: 'linux'
             os: 'ubuntu-latest'
             arch: 'x64'
             target: '--linux'
             build_args: '--linux --x64'
+            unpacked_dir: 'linux-unpacked'
 
     steps:
       - name: Checkout code
-        uses: actions/checkout@v6
+        uses: actions/checkout@v4
 
       - name: Setup Node.js
         uses: actions/setup-node@v4
@@ -134,6 +321,7 @@ jobs:
         uses: oven-sh/setup-bun@v2
         with:
           bun-version: latest
+          cache: true
 
       - name: Setup Python
         uses: actions/setup-python@v5
@@ -144,7 +332,7 @@ jobs:
         uses: extractions/setup-just@v2
 
       - name: Install dependencies
-        run: bun install --no-frozen-lockfile
+        run: bun install --frozen-lockfile
 
       - name: Run postinstall
         run: npm run postinstall || true
@@ -207,7 +395,7 @@ jobs:
           just build-win-x64
           Write-Host "✓Build test passed for ${{ matrix.platform }}"
         env:
-          NODE_OPTIONS: "--max-old-space-size=8192"
+          NODE_OPTIONS: '--max-old-space-size=8192'
           MSVS_VERSION: 2022
           GYP_MSVS_VERSION: 2022
           WindowsTargetPlatformVersion: 10.0.19041.0
@@ -223,7 +411,7 @@ jobs:
           just build-win-arm64
           Write-Host "✓Build test passed for ${{ matrix.platform }}"
         env:
-          NODE_OPTIONS: "--max-old-space-size=8192"
+          NODE_OPTIONS: '--max-old-space-size=8192'
           MSVS_VERSION: 2022
           GYP_MSVS_VERSION: 2022
           WindowsTargetPlatformVersion: 10.0.19041.0
@@ -239,7 +427,7 @@ jobs:
           node scripts/build-with-builder.js auto ${{ matrix.build_args }}
           echo "✓Build test passed for ${{ matrix.platform }}"
         env:
-          NODE_OPTIONS: "--max-old-space-size=8192"
+          NODE_OPTIONS: '--max-old-space-size=8192'
           npm_config_arch: ${{ matrix.arch }}
           npm_config_target_arch: ${{ matrix.arch }}
           npm_config_runtime: electron
@@ -247,8 +435,8 @@ jobs:
           npm_config_disturl: https://electronjs.org/headers
           CI: true
 
-      - name: Verify packaged i18n assets
-        run: bun run test:packaged:i18n
+      - name: Verify packaged bundled bun assets
+        run: bun run test:packaged:bun
 
       - name: Verify build artifacts exist
         shell: bash
@@ -266,7 +454,7 @@ jobs:
               ls out/*.dmg out/*.zip out/*latest*.yml >/dev/null
               ;;
             linux)
-              ls out/*.AppImage out/*.deb out/*latest*.yml >/dev/null
+              ls out/*.deb out/*latest*.yml >/dev/null
               ;;
           esac
 
@@ -287,9 +475,9 @@ jobs:
           Start-Process -FilePath $installer.FullName -ArgumentList '/S' -Wait -NoNewWindow
 
           $candidates = @(
-            "$env:LOCALAPPDATA\Programs\AionUi\AionUi.exe",
-            "$env:ProgramFiles\AionUi\AionUi.exe",
-            "$env:ProgramFiles(x86)\AionUi\AionUi.exe"
+            "$env:LOCALAPPDATA\\Programs\\AionUi\\AionUi.exe",
+            "$env:ProgramFiles\\AionUi\\AionUi.exe",
+            "$env:ProgramFiles(x86)\\AionUi\\AionUi.exe"
           )
 
           $installedExe = $candidates | Where-Object { Test-Path $_ } | Select-Object -First 1
@@ -348,10 +536,6 @@ jobs:
           echo "SMOKE INSTALL: linux"
           echo "=========================================="
 
-          APPIMAGE_FILE=$(ls out/*.AppImage | head -n 1)
-          chmod +x "$APPIMAGE_FILE"
-          "$APPIMAGE_FILE" --appimage-extract-and-run --version || true
-
           DEB_FILE=$(ls out/*.deb | head -n 1)
           PKG_NAME=$(dpkg-deb -f "$DEB_FILE" Package)
           sudo dpkg -i "$DEB_FILE" || sudo apt-get install -f -y
@@ -366,59 +550,24 @@ jobs:
 
           test -x "$INSTALLED_BIN"
 
-  # Job 4: Trigger GPT AI review (only on first PR submission)
-  review:
-    name: AI Review
-    needs: [code-quality, unit-tests, build-test]
-    if: github.event.action == 'opened' && needs.code-quality.result == 'success' && needs.unit-tests.result == 'success' && needs.build-test.result == 'success'
-    uses: './.github/workflows/gpt-review.yml'
-    with:
-      pr_number: '${{ github.event.pull_request.number }}'
-    permissions:
-      contents: read
-      pull-requests: write
-    secrets: inherit
-
-  # Job 5: Check if PR author is an external contributor
-  check-external:
-    name: Check External
-    needs: [code-quality, unit-tests, build-test]
-    if: github.event.action == 'opened' && needs.code-quality.result == 'success' && needs.unit-tests.result == 'success' && needs.build-test.result == 'success'
+  # Job 5: Test release scripts (fast, no build required)
+  release-script-test:
+    name: Release Script Test
+    if: github.event.action != 'closed' && github.event.pull_request.draft == false
     runs-on: ubuntu-latest
-    outputs:
-      is_external: ${{ steps.check.outputs.is_external }}
+    timeout-minutes: 5
     steps:
-      - name: Check author permission level
-        id: check
-        uses: actions/github-script@v7
-        with:
-          script: |
-            const username = context.payload.pull_request.user.login;
-            try {
-              const { data } = await github.rest.repos.getCollaboratorPermissionLevel({
-                owner: context.repo.owner,
-                repo: context.repo.repo,
-                username,
-              });
-              const permission = data.permission;
-              const isExternal = permission !== 'admin' && permission !== 'maintain' && permission !== 'write';
-              core.info(`User ${username}: permission=${permission}, is external: ${isExternal}`);
-              core.setOutput('is_external', String(isExternal));
-            } catch (error) {
-              core.info(`User ${username}: permission check failed (${error.message}), treating as external`);
-              core.setOutput('is_external', 'true');
-            }
+      - name: Checkout code
+        uses: actions/checkout@v4
 
-  # Job 6: Trigger GPT PR assessment for external contributors
-  assessment:
-    name: PR Assessment
-    needs: [check-external]
-    if: needs.check-external.outputs.is_external == 'true'
-    uses: './.github/workflows/gpt-pr-assessment.yml'
-    with:
-      pr_number: '${{ github.event.pull_request.number }}'
-    permissions:
-      contents: read
-      pull-requests: write
-      issues: read
-    secrets: inherit
+      - name: Create mock build artifacts
+        shell: bash
+        run: bash scripts/create-mock-release-artifacts.sh build-artifacts
+
+      - name: Run prepare-release-assets script
+        shell: bash
+        run: bash scripts/prepare-release-assets.sh build-artifacts release-assets
+
+      - name: Validate script output
+        shell: bash
+        run: bash scripts/verify-release-assets.sh release-assets

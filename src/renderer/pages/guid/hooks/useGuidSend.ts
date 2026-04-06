@@ -5,13 +5,15 @@
  */
 
 import { ipcBridge } from '@/common';
-import type { TProviderWithModel } from '@/common/storage';
+import type { TProviderWithModel } from '@/common/config/storage';
+import type { TChatConversation } from '@/common/config/storage';
+import { buildAgentConversationParams } from '@/common/utils/buildAgentConversationParams';
 import { emitter } from '@/renderer/utils/emitter';
-import { buildDisplayMessage } from '@/renderer/utils/messageFiles';
-import { updateWorkspaceTime } from '@/renderer/utils/workspaceHistory';
-import { isAcpRoutedPresetType, type PresetAgentType } from '@/types/acpTypes';
+import { buildDisplayMessage } from '@/renderer/utils/file/messageFiles';
+import { updateWorkspaceTime } from '@/renderer/utils/workspace/workspaceHistory';
+import { isAcpRoutedPresetType, type PresetAgentType } from '@/common/types/acpTypes';
 import { Message } from '@arco-design/web-react';
-import { useCallback } from 'react';
+import { useCallback, useRef } from 'react';
 import { type TFunction } from 'i18next';
 import type { NavigateFunction } from 'react-router-dom';
 import type { AcpBackend, AvailableAgent, EffectiveAgentInfo } from '../types';
@@ -25,6 +27,7 @@ export type GuidSendDeps = {
   dir: string;
   setDir: React.Dispatch<React.SetStateAction<string>>;
   setLoading: React.Dispatch<React.SetStateAction<boolean>>;
+  loading: boolean;
 
   // Agent state
   selectedAgent: AcpBackend | 'custom';
@@ -33,15 +36,21 @@ export type GuidSendDeps = {
   isPresetAgent: boolean;
   selectedMode: string;
   selectedAcpModel: string | null;
+  pendingConfigOptions: Record<string, string>;
+  cachedConfigOptions: import('@/common/types/acpTypes').AcpSessionConfigOption[];
   currentModel: TProviderWithModel | undefined;
 
   // Agent helpers
   findAgentByKey: (key: string) => AvailableAgent | undefined;
   getEffectiveAgentType: (agentInfo: { backend: AcpBackend; customAgentId?: string } | undefined) => EffectiveAgentInfo;
-  resolvePresetRulesAndSkills: (agentInfo: { backend: AcpBackend; customAgentId?: string; context?: string } | undefined) => Promise<{ rules?: string; skills?: string }>;
-  resolveEnabledSkills: (agentInfo: { backend: AcpBackend; customAgentId?: string } | undefined) => string[] | undefined;
-  isMainAgentAvailable: (agentType: PresetAgentType) => boolean;
-  getAvailableFallbackAgent: () => PresetAgentType | null;
+  resolvePresetRulesAndSkills: (
+    agentInfo: { backend: AcpBackend; customAgentId?: string; context?: string } | undefined
+  ) => Promise<{ rules?: string; skills?: string }>;
+  resolveEnabledSkills: (
+    agentInfo: { backend: AcpBackend; customAgentId?: string } | undefined
+  ) => string[] | undefined;
+  isMainAgentAvailable: (agentType: string) => boolean;
+  getAvailableFallbackAgent: () => string | null;
   currentEffectiveAgentInfo: EffectiveAgentInfo;
   isGoogleAuth: boolean;
 
@@ -54,7 +63,7 @@ export type GuidSendDeps = {
   // Navigation & tabs
   navigate: NavigateFunction;
   closeAllTabs: () => void;
-  openTab: (conversation: any) => void;
+  openTab: (conversation: TChatConversation) => void;
   t: TFunction;
 };
 
@@ -68,7 +77,42 @@ export type GuidSendResult = {
  * Hook that manages the send logic for all conversation types (gemini/openclaw/nanobot/acp).
  */
 export const useGuidSend = (deps: GuidSendDeps): GuidSendResult => {
-  const { input, setInput, files, setFiles, dir, setDir, setLoading, selectedAgent, selectedAgentKey, selectedAgentInfo, isPresetAgent, selectedMode, selectedAcpModel, currentModel, findAgentByKey, getEffectiveAgentType, resolvePresetRulesAndSkills, resolveEnabledSkills, isMainAgentAvailable, getAvailableFallbackAgent, currentEffectiveAgentInfo, isGoogleAuth, setMentionOpen, setMentionQuery, setMentionSelectorOpen, setMentionActiveIndex, navigate, closeAllTabs, openTab, t } = deps;
+  const {
+    input,
+    setInput,
+    files,
+    setFiles,
+    dir,
+    setDir,
+    setLoading,
+    loading,
+    selectedAgent,
+    selectedAgentKey,
+    selectedAgentInfo,
+    isPresetAgent,
+    selectedMode,
+    selectedAcpModel,
+    pendingConfigOptions,
+    cachedConfigOptions,
+    currentModel,
+    findAgentByKey,
+    getEffectiveAgentType,
+    resolvePresetRulesAndSkills,
+    resolveEnabledSkills,
+    isMainAgentAvailable,
+    getAvailableFallbackAgent,
+    currentEffectiveAgentInfo,
+    isGoogleAuth,
+    setMentionOpen,
+    setMentionQuery,
+    setMentionSelectorOpen,
+    setMentionActiveIndex,
+    navigate,
+    closeAllTabs,
+    openTab,
+    t,
+  } = deps;
+  const sendingRef = useRef(false);
 
   const handleSend = useCallback(async () => {
     const isCustomWorkspace = !!dir;
@@ -109,20 +153,38 @@ export const useGuidSend = (deps: GuidSendDeps): GuidSendResult => {
       };
       try {
         const presetAssistantIdToPass = isPreset ? agentInfo?.customAgentId : undefined;
-
-        const conversation = await ipcBridge.conversation.create.invoke({
-          type: 'gemini',
+        const geminiConversationParams = buildAgentConversationParams({
+          backend: 'gemini',
           name: input,
+          agentName: agentInfo?.name,
+          workspace: finalWorkspace,
           model: placeholderModel,
+          customAgentId: agentInfo?.customAgentId,
+          customWorkspace: isCustomWorkspace,
+          isPreset,
+          presetAgentType: finalEffectiveAgentType,
+          presetResources: isPreset
+            ? {
+                rules: presetRules,
+                enabledSkills,
+              }
+            : undefined,
+          sessionMode: selectedMode,
           extra: {
             defaultFiles: files,
-            workspace: finalWorkspace,
-            customWorkspace: isCustomWorkspace,
-            webSearchEngine: placeholderModel.platform === 'gemini-with-google-auth' || placeholderModel.platform === 'gemini-vertex-ai' ? 'google' : 'default',
-            presetRules: isPreset ? presetRules : undefined,
-            enabledSkills: isPreset ? enabledSkills : undefined,
+            webSearchEngine:
+              placeholderModel.platform === 'gemini-with-google-auth' ||
+              placeholderModel.platform === 'gemini-vertex-ai'
+                ? 'google'
+                : 'default',
+          },
+        });
+
+        const conversation = await ipcBridge.conversation.create.invoke({
+          ...geminiConversationParams,
+          extra: {
+            ...geminiConversationParams.extra,
             presetAssistantId: presetAssistantIdToPass,
-            sessionMode: selectedMode,
           },
         });
 
@@ -157,31 +219,32 @@ export const useGuidSend = (deps: GuidSendDeps): GuidSendResult => {
     // OpenClaw Gateway path
     if (selectedAgent === 'openclaw-gateway') {
       const openclawAgentInfo = agentInfo || findAgentByKey(selectedAgentKey);
+      const openclawConversationParams = buildAgentConversationParams({
+        backend: openclawAgentInfo?.backend || 'openclaw-gateway',
+        name: input,
+        agentName: openclawAgentInfo?.name,
+        workspace: finalWorkspace,
+        model: currentModel!,
+        cliPath: openclawAgentInfo?.cliPath,
+        customAgentId: openclawAgentInfo?.customAgentId,
+        customWorkspace: isCustomWorkspace,
+        extra: {
+          defaultFiles: files,
+          runtimeValidation: {
+            expectedWorkspace: finalWorkspace,
+            expectedBackend: openclawAgentInfo?.backend,
+            expectedAgentName: openclawAgentInfo?.name,
+            expectedCliPath: openclawAgentInfo?.cliPath,
+            expectedModel: currentModel?.useModel,
+            switchedAt: Date.now(),
+          },
+          enabledSkills: isPreset ? enabledSkills : undefined,
+          presetAssistantId: isPreset ? openclawAgentInfo?.customAgentId : undefined,
+        },
+      });
 
       try {
-        const conversation = await ipcBridge.conversation.create.invoke({
-          type: 'openclaw-gateway',
-          name: input,
-          model: currentModel!,
-          extra: {
-            defaultFiles: files,
-            workspace: finalWorkspace,
-            customWorkspace: isCustomWorkspace,
-            backend: openclawAgentInfo?.backend,
-            cliPath: openclawAgentInfo?.cliPath,
-            agentName: openclawAgentInfo?.name,
-            runtimeValidation: {
-              expectedWorkspace: finalWorkspace,
-              expectedBackend: openclawAgentInfo?.backend,
-              expectedAgentName: openclawAgentInfo?.name,
-              expectedCliPath: openclawAgentInfo?.cliPath,
-              expectedModel: currentModel?.useModel,
-              switchedAt: Date.now(),
-            },
-            enabledSkills: isPreset ? enabledSkills : undefined,
-            presetAssistantId: isPreset ? openclawAgentInfo?.customAgentId : undefined,
-          },
-        });
+        const conversation = await ipcBridge.conversation.create.invoke(openclawConversationParams);
 
         if (!conversation || !conversation.id) {
           alert('Failed to create OpenClaw conversation. Please ensure the OpenClaw Gateway is running.');
@@ -214,20 +277,23 @@ export const useGuidSend = (deps: GuidSendDeps): GuidSendResult => {
     // Nanobot path
     if (selectedAgent === 'nanobot') {
       const nanobotAgentInfo = agentInfo || findAgentByKey(selectedAgentKey);
+      const nanobotConversationParams = buildAgentConversationParams({
+        backend: nanobotAgentInfo?.backend || 'nanobot',
+        name: input,
+        agentName: nanobotAgentInfo?.name,
+        workspace: finalWorkspace,
+        model: currentModel!,
+        customAgentId: nanobotAgentInfo?.customAgentId,
+        customWorkspace: isCustomWorkspace,
+        extra: {
+          defaultFiles: files,
+          enabledSkills: isPreset ? enabledSkills : undefined,
+          presetAssistantId: isPreset ? nanobotAgentInfo?.customAgentId : undefined,
+        },
+      });
 
       try {
-        const conversation = await ipcBridge.conversation.create.invoke({
-          type: 'nanobot',
-          name: input,
-          model: currentModel!,
-          extra: {
-            defaultFiles: files,
-            workspace: finalWorkspace,
-            customWorkspace: isCustomWorkspace,
-            enabledSkills: isPreset ? enabledSkills : undefined,
-            presetAssistantId: isPreset ? nanobotAgentInfo?.customAgentId : undefined,
-          },
-        });
+        const conversation = await ipcBridge.conversation.create.invoke(nanobotConversationParams);
 
         if (!conversation || !conversation.id) {
           alert('Failed to create Nanobot conversation. Please ensure nanobot is installed.');
@@ -257,38 +323,123 @@ export const useGuidSend = (deps: GuidSendDeps): GuidSendResult => {
       return;
     }
 
-    // ACP path (including preset with claude agent type)
-    {
-      const agentTypeChanged = selectedAgent !== finalEffectiveAgentType;
-      const acpBackend: PresetAgentType | undefined = agentTypeChanged ? finalEffectiveAgentType : isPreset && isAcpRoutedPresetType(finalEffectiveAgentType) ? finalEffectiveAgentType : selectedAgent;
-
-      const acpAgentInfo = agentTypeChanged ? findAgentByKey(acpBackend as string) : agentInfo || findAgentByKey(selectedAgentKey);
-
-      if (!acpAgentInfo && !isPreset) {
-        console.warn(`${acpBackend} CLI not found, but proceeding to let conversation panel handle it.`);
-      }
+    // Aionrs path
+    if (selectedAgent === 'aionrs') {
+      const aionrsAgentInfo = agentInfo || findAgentByKey(selectedAgentKey);
 
       try {
         const conversation = await ipcBridge.conversation.create.invoke({
-          type: 'acp',
+          type: 'aionrs',
           name: input,
           model: currentModel!,
           extra: {
             defaultFiles: files,
             workspace: finalWorkspace,
             customWorkspace: isCustomWorkspace,
-            backend: acpBackend,
-            cliPath: acpAgentInfo?.cliPath,
-            agentName: acpAgentInfo?.name,
-            customAgentId: acpAgentInfo?.customAgentId,
-            presetContext: isPreset ? presetRules : undefined,
+            presetRules: isPreset ? presetRules : undefined,
             enabledSkills: isPreset ? enabledSkills : undefined,
-            presetAssistantId: isPreset ? agentInfo?.customAgentId || acpAgentInfo?.customAgentId : undefined,
+            presetAssistantId: isPreset ? aionrsAgentInfo?.customAgentId : undefined,
             sessionMode: selectedMode,
-            currentModelId: selectedAcpModel || undefined,
           },
         });
 
+        if (!conversation || !conversation.id) {
+          alert('Failed to create Aion CLI conversation. Please ensure aionrs is installed.');
+          return;
+        }
+
+        if (isCustomWorkspace) {
+          closeAllTabs();
+          updateWorkspaceTime(finalWorkspace);
+          openTab(conversation);
+        }
+
+        emitter.emit('chat.history.refresh');
+
+        const initialMessage = {
+          input,
+          files: files.length > 0 ? files : undefined,
+        };
+        sessionStorage.setItem(`aionrs_initial_message_${conversation.id}`, JSON.stringify(initialMessage));
+
+        await navigate(`/conversation/${conversation.id}`);
+      } catch (error: unknown) {
+        const errorMessage = error instanceof Error ? error.message : String(error);
+        alert(`Failed to create Aion CLI conversation: ${errorMessage}`);
+        throw error;
+      }
+      return;
+    }
+
+    // Remaining agent path (ACP/remote/custom, including preset fallbacks)
+    {
+      // Agent-type fallback only applies to preset assistants whose primary agent
+      // was unavailable and got switched (e.g. claude → gemini).  For non-preset
+      // agents (including extension-contributed ACP adapters with backend='custom'),
+      // we must keep the original selectedAgent so the correct backend/cliPath is used.
+      const agentTypeChanged = isPreset && selectedAgent !== finalEffectiveAgentType;
+      const acpBackend: string | undefined = agentTypeChanged
+        ? finalEffectiveAgentType
+        : isPreset && isAcpRoutedPresetType(finalEffectiveAgentType as PresetAgentType)
+          ? finalEffectiveAgentType
+          : selectedAgent;
+
+      const acpAgentInfo = agentTypeChanged
+        ? findAgentByKey(acpBackend as string)
+        : agentInfo || findAgentByKey(selectedAgentKey);
+
+      if (!acpAgentInfo && !isPreset) {
+        console.warn(`${acpBackend} CLI not found, but proceeding to let conversation panel handle it.`);
+      }
+      const agentBackend = acpBackend || selectedAgent;
+      const agentConversationParams = buildAgentConversationParams({
+        backend: agentBackend,
+        name: input,
+        agentName: acpAgentInfo?.name,
+        workspace: finalWorkspace,
+        model: currentModel!,
+        cliPath: acpAgentInfo?.cliPath,
+        customAgentId: acpAgentInfo?.customAgentId,
+        customWorkspace: isCustomWorkspace,
+        isPreset,
+        presetAgentType: finalEffectiveAgentType,
+        presetResources: isPreset
+          ? {
+              rules: presetRules,
+              enabledSkills,
+            }
+          : undefined,
+        sessionMode: selectedMode,
+        currentModelId: selectedAcpModel || undefined,
+        extra: {
+          defaultFiles: files,
+        },
+      });
+
+      try {
+        // Merge pending selections into cached options so the UI shows the user's choice immediately
+        const mergedCachedConfigOptions =
+          cachedConfigOptions.length > 0
+            ? Object.keys(pendingConfigOptions).length > 0
+              ? cachedConfigOptions.map((opt) => {
+                  const pending = opt.id ? pendingConfigOptions[opt.id] : undefined;
+                  return pending ? { ...opt, currentValue: pending, selectedValue: pending } : opt;
+                })
+              : cachedConfigOptions
+            : undefined;
+
+        // Inject cachedConfigOptions & pendingConfigOptions into the params built by utility
+        if (mergedCachedConfigOptions) {
+          agentConversationParams.extra = {
+            ...agentConversationParams.extra,
+            cachedConfigOptions: mergedCachedConfigOptions,
+          };
+        }
+        if (Object.keys(pendingConfigOptions).length > 0) {
+          agentConversationParams.extra = { ...agentConversationParams.extra, pendingConfigOptions };
+        }
+
+        const conversation = await ipcBridge.conversation.create.invoke(agentConversationParams);
         if (!conversation || !conversation.id) {
           console.error('Failed to create ACP conversation - conversation object is null or missing id');
           return;
@@ -314,9 +465,34 @@ export const useGuidSend = (deps: GuidSendDeps): GuidSendResult => {
         throw error;
       }
     }
-  }, [input, files, dir, selectedAgent, selectedAgentKey, selectedAgentInfo, isPresetAgent, selectedMode, selectedAcpModel, currentModel, findAgentByKey, getEffectiveAgentType, resolvePresetRulesAndSkills, resolveEnabledSkills, isMainAgentAvailable, getAvailableFallbackAgent, navigate, closeAllTabs, openTab, t]);
+  }, [
+    input,
+    files,
+    dir,
+    selectedAgent,
+    selectedAgentKey,
+    selectedAgentInfo,
+    isPresetAgent,
+    selectedMode,
+    selectedAcpModel,
+    pendingConfigOptions,
+    cachedConfigOptions,
+    currentModel,
+    findAgentByKey,
+    getEffectiveAgentType,
+    resolvePresetRulesAndSkills,
+    resolveEnabledSkills,
+    isMainAgentAvailable,
+    getAvailableFallbackAgent,
+    navigate,
+    closeAllTabs,
+    openTab,
+    t,
+  ]);
 
   const sendMessageHandler = useCallback(() => {
+    if (loading || sendingRef.current) return;
+    sendingRef.current = true;
     setLoading(true);
     handleSend()
       .then(() => {
@@ -332,12 +508,30 @@ export const useGuidSend = (deps: GuidSendDeps): GuidSendResult => {
         console.error('Failed to send message:', error);
       })
       .finally(() => {
+        sendingRef.current = false;
         setLoading(false);
       });
-  }, [handleSend, setLoading, setInput, setMentionOpen, setMentionQuery, setMentionSelectorOpen, setMentionActiveIndex, setFiles, setDir]);
+  }, [
+    loading,
+    handleSend,
+    setLoading,
+    setInput,
+    setMentionOpen,
+    setMentionQuery,
+    setMentionSelectorOpen,
+    setMentionActiveIndex,
+    setFiles,
+    setDir,
+  ]);
 
   // Calculate button disabled state
-  const isButtonDisabled = !input.trim() || ((((!selectedAgent || selectedAgent === 'gemini') && !isPresetAgent) || (isPresetAgent && currentEffectiveAgentInfo.agentType === 'gemini' && currentEffectiveAgentInfo.isAvailable)) && !currentModel && isGoogleAuth);
+  const isButtonDisabled =
+    loading ||
+    !input.trim() ||
+    ((((!selectedAgent || selectedAgent === 'gemini') && !isPresetAgent) ||
+      (isPresetAgent && currentEffectiveAgentInfo.agentType === 'gemini' && currentEffectiveAgentInfo.isAvailable)) &&
+      !currentModel &&
+      isGoogleAuth);
 
   return {
     handleSend,
